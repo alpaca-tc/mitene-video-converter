@@ -1,0 +1,291 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+require 'json'
+require 'fileutils'
+require 'pathname'
+require 'open3'
+
+# みてね (FamilyAlbum) upload limits per plan
+# Source: https://help.family-album.com/hc/ja/articles/360038720993
+PLAN_LIMITS = {
+  'free'    => { max_duration: 120, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 },
+  'premium' => { max_duration: 600, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 },
+  'pro'     => { max_duration: 600, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 }
+}.freeze
+
+SUPPORTED_INPUT_EXTENSIONS = %w[.mp4 .mov .qt .3gp .m4v .mts .hevc .avi .mkv .wmv .flv .ts .m2ts].freeze
+OUTPUT_EXTENSION = '.mp4'
+AUDIO_BITRATE    = '192k'
+AUDIO_BPS        = 192_000
+CRF_HIGH_QUALITY = 18
+
+def run_command(*args)
+  stdout, stderr, status = Open3.capture3(*args)
+  [stdout, stderr, status.success?]
+end
+
+def check_dependencies!
+  %w[ffmpeg ffprobe].each do |cmd|
+    _, _, ok = run_command('which', cmd)
+    abort "Error: #{cmd} is not installed. Install with: brew install ffmpeg" unless ok
+  end
+end
+
+def probe_video(path)
+  stdout, stderr, ok = run_command(
+    'ffprobe', '-v', 'quiet',
+    '-print_format', 'json',
+    '-show_streams', '-show_format',
+    path
+  )
+  abort "Error: Failed to probe #{path}\n#{stderr}" unless ok
+  JSON.parse(stdout)
+rescue JSON::ParserError => e
+  abort "Error: Could not parse ffprobe output for #{path}: #{e.message}"
+end
+
+def video_info(path)
+  data         = probe_video(path)
+  video_stream = data['streams'].find { |s| s['codec_type'] == 'video' }
+  audio_stream = data['streams'].find { |s| s['codec_type'] == 'audio' }
+  duration     = data.dig('format', 'duration')&.to_f || 0.0
+
+  # Per-stream bitrate is more accurate than total format bitrate for video-only bps
+  video_bps = video_stream&.dig('bit_rate')&.to_i
+  total_bps  = data.dig('format', 'bit_rate')&.to_i
+  audio_bps  = audio_stream&.dig('bit_rate')&.to_i || AUDIO_BPS
+  # Estimate video bps from total when stream-level is not available
+  video_bps ||= total_bps ? [total_bps - audio_bps, 0].max : nil
+
+  {
+    duration:    duration,
+    width:       video_stream&.dig('width')&.to_i,
+    height:      video_stream&.dig('height')&.to_i,
+    video_codec: video_stream&.dig('codec_name'),
+    video_bps:   video_bps,
+    size:        File.size(path)
+  }
+end
+
+# Scale dimensions down to fit within max, keeping aspect ratio and even pixel count.
+# Returns [new_w, new_h] or nil if no scaling needed.
+def compute_scale(width, height, max_width, max_height)
+  return nil unless width && height
+  return nil if width <= max_width && height <= max_height
+
+  ratio = [max_width.to_f / width, max_height.to_f / height].min
+  new_w = ((width  * ratio).floor / 2) * 2
+  new_h = ((height * ratio).floor / 2) * 2
+  [new_w, new_h]
+end
+
+# Target file size for a segment: preserve original quality but never exceed plan limit.
+#   target = min(original_size * seg_duration / total_duration, max_file_size)
+def segment_target_size(info, seg_duration, max_file_size)
+  proportional = (info[:size].to_f * seg_duration / info[:duration]).to_i
+  [proportional, max_file_size].min
+end
+
+# Choose between CRF (quality-based) and bitrate-controlled encoding.
+# CRF is preferred when the source bitrate (adjusted for any resolution change)
+# fits within the target; otherwise bitrate control is used to guarantee the size limit.
+#
+# Returns an array of ffmpeg encoding arguments (video codec section only).
+def video_encode_args(info, scale, target_size, seg_duration)
+  target_video_bps = (target_size * 8.0 / seg_duration - AUDIO_BPS).to_i
+
+  if target_video_bps <= 0
+    abort "Error: Target size #{format_size(target_size)} is too small for a #{format_duration(seg_duration)} segment " \
+          "(audio alone requires ~#{format_size(AUDIO_BPS * seg_duration / 8)})."
+  end
+
+  # Adjust source video bps for any resolution downscale (pixel area ratio)
+  source_video_bps = info[:video_bps]
+  adjusted_bps =
+    if source_video_bps && info[:width] && info[:height] && scale
+      pixel_ratio = (scale[0].to_f * scale[1]) / (info[:width] * info[:height])
+      (source_video_bps * pixel_ratio).to_i
+    else
+      source_video_bps
+    end
+
+  if adjusted_bps.nil? || adjusted_bps <= target_video_bps
+    # Source fits within target → CRF for best quality
+    ['-c:v', 'libx264', '-crf', CRF_HIGH_QUALITY.to_s, '-preset', 'slow']
+  else
+    # Source exceeds target → bitrate-controlled to guarantee size limit
+    vbr_k = [target_video_bps / 1000, 50].max
+    [
+      '-c:v', 'libx264',
+      '-b:v', "#{vbr_k}k",
+      '-maxrate', "#{(vbr_k * 1.5).to_i}k",
+      '-bufsize', "#{(vbr_k * 2).to_i}k",
+      '-preset', 'slow'
+    ]
+  end
+end
+
+def encode_segment(input_path, output_path, start_time:, duration:, scale:, video_args:, dry_run:)
+  scale_args = scale ? ['-vf', "scale=#{scale[0]}:#{scale[1]}"] : []
+
+  args = [
+    'ffmpeg', '-y',
+    '-ss', start_time.to_s,
+    '-i', input_path,
+    '-t', duration.to_s,
+    *video_args,
+    '-c:a', 'aac',
+    '-b:a', AUDIO_BITRATE,
+    '-movflags', '+faststart',
+    *scale_args,
+    output_path
+  ]
+
+  if dry_run
+    puts "    [dry-run] #{args.join(' ')}"
+    return 0
+  end
+
+  _, stderr, ok = run_command(*args)
+  abort "Error encoding #{output_path}:\n#{stderr}" unless ok
+  File.size(output_path)
+end
+
+def format_duration(seconds)
+  seconds = seconds.to_i
+  h = seconds / 3600
+  m = (seconds % 3600) / 60
+  s = seconds % 60
+  h > 0 ? format('%d:%02d:%02d', h, m, s) : format('%d:%02d', m, s)
+end
+
+def format_size(bytes)
+  return 'unknown' unless bytes
+  if    bytes >= 1_073_741_824 then format('%.2f GB', bytes.to_f / 1_073_741_824)
+  elsif bytes >= 1_048_576     then format('%.1f MB', bytes.to_f / 1_048_576)
+  else                              format('%.1f KB', bytes.to_f / 1_024)
+  end
+end
+
+def process_video(input_path, output_dir, limits, options)
+  dry_run      = options[:dry_run]
+  max_duration = limits[:max_duration]
+  max_size     = limits[:max_file_size]
+
+  puts "Processing: #{input_path}"
+
+  info = video_info(input_path)
+  puts "  Info: #{format_duration(info[:duration])}, #{info[:width]}x#{info[:height]}, " \
+       "#{format_size(info[:size])}, codec=#{info[:video_codec]}"
+
+  scale = compute_scale(info[:width], info[:height], limits[:max_width], limits[:max_height])
+  puts "  Scale: #{info[:width]}x#{info[:height]} -> #{scale[0]}x#{scale[1]}" if scale
+
+  base_name = Pathname.new(input_path).basename('.*').to_s
+  duration  = info[:duration]
+
+  # Build segments by splitting on max_duration
+  segments =
+    if duration <= max_duration
+      [{ start: 0.0, duration: duration, suffix: nil }]
+    else
+      num = (duration / max_duration).ceil
+      num.times.map do |i|
+        start = i * max_duration
+        { start: start.to_f, duration: [max_duration, duration - start].min, suffix: format('part%02d', i + 1) }
+      end
+    end
+
+  puts "  Split: #{segments.length} segments of up to #{format_duration(max_duration)}" if segments.length > 1
+
+  segments.each do |seg|
+    output_name = seg[:suffix] ? "#{base_name}_#{seg[:suffix]}#{OUTPUT_EXTENSION}" : "#{base_name}#{OUTPUT_EXTENSION}"
+    output_path = File.join(output_dir, output_name)
+
+    target_size  = segment_target_size(info, seg[:duration], max_size)
+    vargs        = video_encode_args(info, scale, target_size, seg[:duration])
+    quality_mode = vargs.include?('-crf') ? "CRF #{CRF_HIGH_QUALITY}" : "#{vargs[vargs.index('-b:v') + 1]} bitrate"
+
+    range = "#{format_duration(seg[:start])} - #{format_duration(seg[:start] + seg[:duration])}"
+    puts "  -> #{output_path} (#{range}, target #{format_size(target_size)}, #{quality_mode})"
+
+    result_size = encode_segment(
+      input_path, output_path,
+      start_time: seg[:start],
+      duration:   seg[:duration],
+      scale:      scale,
+      video_args: vargs,
+      dry_run:    dry_run
+    )
+
+    puts "     Output: #{format_size(result_size)}" unless dry_run
+  end
+end
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+options = {
+  plan:    'premium',
+  output:  nil,
+  dry_run: false
+}
+
+OptionParser.new do |opts|
+  opts.banner = 'Usage: mitene-convert [options] <file_or_directory...>'
+  opts.separator ''
+  opts.separator 'Options:'
+
+  opts.on('--plan PLAN', %w[free premium pro],
+          'Target plan: free (2min/5GB), premium or pro (10min/5GB)  [default: premium]') do |v|
+    options[:plan] = v
+  end
+
+  opts.on('--output DIR', 'Output directory  [default: ./converted]') do |v|
+    options[:output] = v
+  end
+
+  opts.on('--dry-run', 'Show what would be done without converting') do
+    options[:dry_run] = true
+  end
+
+  opts.on('-h', '--help', 'Show this help') do
+    puts opts
+    exit
+  end
+end.parse!
+
+abort 'Error: No input files or directories specified. Use --help for usage.' if ARGV.empty?
+
+check_dependencies!
+
+limits     = PLAN_LIMITS[options[:plan]]
+output_dir = options[:output] || './converted'
+
+FileUtils.mkdir_p(output_dir) unless options[:dry_run]
+
+input_files = ARGV.flat_map do |arg|
+  if File.directory?(arg)
+    Dir.glob(File.join(arg, '**', '*')).select do |f|
+      File.file?(f) && SUPPORTED_INPUT_EXTENSIONS.include?(File.extname(f).downcase)
+    end.sort
+  elsif File.file?(arg)
+    [arg]
+  else
+    warn "Warning: #{arg} not found, skipping."
+    []
+  end
+end
+
+abort 'Error: No valid video files found.' if input_files.empty?
+
+puts "Plan:   #{options[:plan]} (max #{format_duration(limits[:max_duration])}/segment, max #{limits[:max_width]}x#{limits[:max_height]}, max #{format_size(limits[:max_file_size])}/segment)"
+puts "Output: #{output_dir}"
+puts "Files:  #{input_files.length}"
+puts '[dry-run]' if options[:dry_run]
+puts
+
+input_files.each { |f| process_video(f, output_dir, limits, options) }
+
+puts "\nDone!"
