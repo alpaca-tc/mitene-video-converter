@@ -9,10 +9,11 @@ require 'open3'
 
 # みてね (FamilyAlbum) upload limits per plan
 # Source: https://help.family-album.com/hc/ja/articles/360038720993
+# Resolution: 4K is accepted (resized server-side); 5GB is the PC uploader limit
 PLAN_LIMITS = {
-  'free'    => { max_duration: 120, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 },
-  'premium' => { max_duration: 600, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 },
-  'pro'     => { max_duration: 600, max_width: 1920, max_height: 1080, max_file_size: 5 * 1024 ** 3 }
+  'free'    => { max_duration: 120, max_width: 3840, max_height: 2160, max_file_size: 5 * 1024 ** 3 },
+  'premium' => { max_duration: 600, max_width: 3840, max_height: 2160, max_file_size: 5 * 1024 ** 3 },
+  'pro'     => { max_duration: 600, max_width: 3840, max_height: 2160, max_file_size: 5 * 1024 ** 3 }
 }.freeze
 
 SUPPORTED_INPUT_EXTENSIONS = %w[.mp4 .mov .qt .3gp .m4v .mts .hevc .avi .mkv .wmv .flv .ts .m2ts].freeze
@@ -73,6 +74,8 @@ end
 # Returns [new_w, new_h] or nil if no scaling needed.
 def compute_scale(width, height, max_width, max_height)
   return nil unless width && height
+  # Portrait video: apply the limit to the long side instead of the width
+  max_width, max_height = max_height, max_width if height > width
   return nil if width <= max_width && height <= max_height
 
   ratio = [max_width.to_f / width, max_height.to_f / height].min
